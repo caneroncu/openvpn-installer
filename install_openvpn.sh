@@ -6,12 +6,15 @@ CLIENT_NAME="client"
 SERVER_IP=$(curl -s https://api.ipify.org)
 PROFILE_DIR="/root/ovpn-profiles"
 
-# Install dependencies
-apt update && apt install -y openvpn easy-rsa curl ufw
+# Install required packages
+yum install -y epel-release
+yum install -y openvpn easy-rsa firewalld curl
 
 # Set up Easy-RSA
-make-cadir ~/openvpn-ca
-cd ~/openvpn-ca
+EASYRSA_DIR="/etc/openvpn/easy-rsa"
+mkdir -p $EASYRSA_DIR
+cp -r /usr/share/easy-rsa/3/* $EASYRSA_DIR
+cd $EASYRSA_DIR
 ./easyrsa init-pki
 echo -ne "\n" | ./easyrsa build-ca nopass
 ./easyrsa gen-req server nopass <<< "yes"
@@ -24,9 +27,9 @@ echo -ne "\n" | ./easyrsa build-ca nopass
 # Move server files
 cp pki/ca.crt pki/dh.pem pki/private/server.key pki/issued/server.crt /etc/openvpn/
 cp pki/crl.pem /etc/openvpn/crl.pem
-chown nobody:nogroup /etc/openvpn/crl.pem
+chown nobody:nobody /etc/openvpn/crl.pem
 
-# Create OpenVPN server config with PAM auth
+# Create server.conf with PAM plugin
 cat > /etc/openvpn/server.conf <<EOF
 port 1194
 proto udp
@@ -36,7 +39,8 @@ cert server.crt
 key server.key
 dh dh.pem
 crl-verify crl.pem
-auth-user-pass-verify /etc/openvpn/checkpsw.sh via-env
+plugin /usr/lib64/openvpn/plugins/openvpn-plugin-auth-pam.so openvpn
+client-cert-not-required
 username-as-common-name
 server 10.8.0.0 255.255.255.0
 push "redirect-gateway def1 bypass-dhcp"
@@ -44,39 +48,40 @@ push "dhcp-option DNS 1.1.1.1"
 keepalive 10 120
 cipher AES-256-CBC
 user nobody
-group nogroup
+group nobody
 persist-key
 persist-tun
-plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so login
 status openvpn-status.log
 verb 3
 EOF
 
 # Enable IP forwarding
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
 sysctl -p
 
-# Basic firewall config (UFW)
-ufw allow OpenSSH
-ufw allow 1194/udp
-ufw disable
-ufw --force enable
+# Start and enable firewalld
+systemctl start firewalld
+systemctl enable firewalld
+firewall-cmd --permanent --add-service=openvpn
+firewall-cmd --permanent --add-service=ssh
+firewall-cmd --permanent --add-masquerade
+firewall-cmd --reload
 
-# NAT rules
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
-iptables-save > /etc/iptables.rules
-
-cat > /etc/network/if-up.d/iptables <<EOF
-#!/bin/sh
-iptables-restore < /etc/iptables.rules
+# Enable NAT
+cat > /etc/sysconfig/iptables-openvpn <<EOF
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+COMMIT
 EOF
-chmod +x /etc/network/if-up.d/iptables
+
+iptables-restore < /etc/sysconfig/iptables-openvpn
 
 # Start OpenVPN
-systemctl start openvpn@server
 systemctl enable openvpn@server
+systemctl start openvpn@server
 
-# Create client config with auth prompt
+# Create client profile
 mkdir -p $PROFILE_DIR
 cat > $PROFILE_DIR/$CLIENT_NAME.ovpn <<EOF
 client
@@ -102,13 +107,17 @@ $(cat pki/private/$CLIENT_NAME.key)
 </key>
 EOF
 
-# Create user for VPN login
-USERNAME="vpnuser"
-PASSWORD="changeme123"
+# Prompt for username and password
+echo "Enter VPN username:"
+read -r USERNAME
+echo "Enter VPN password:"
+read -rs PASSWORD
 
-echo -e "$PASSWORD\n$PASSWORD" | adduser --quiet --gecos "" $USERNAME
+# Create the user with the given credentials
+useradd "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
 
-echo "✅ OpenVPN installed with username/password login."
+echo "✅ OpenVPN installed with username/password login on CentOS."
 echo "👤 Username: $USERNAME"
 echo "🔑 Password: $PASSWORD"
-echo "📁 Download your profile: $PROFILE_DIR/$CLIENT_NAME.ovpn"
+echo "📁 Your profile: $PROFILE_DIR/$CLIENT_NAME.ovpn"
